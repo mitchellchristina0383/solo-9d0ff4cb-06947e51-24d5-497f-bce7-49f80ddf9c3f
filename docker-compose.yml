@@ -1,0 +1,18 @@
+services:
+  job-console:
+    build: .
+    image: thumbnail-job-console:latest
+    container_name: thumbnail-job-console
+    # tini 作为 PID 1 负责回收孤儿进程（样例主进程先退后，worker 会被 reparent 到 PID 1）
+    init: true
+    ports:
+      - "8000:8000"
+    environment:
+      JOB_OUT_DIR: /data/jobs
+      JOB_MONITOR_INTERVAL: "0.2"
+    volumes:
+      - jobs-data:/data/jobs
+    restart: unless-stopped
+
+volumes:
+  jobs-data:

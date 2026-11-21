@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>缩略图批作业台</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 24px; color: #1f2933; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .hint { color: #52606d; font-size: 13px; max-width: 980px; }
+  form { background: #f5f7fa; border: 1px solid #e4e7eb; border-radius: 8px; padding: 14px 16px;
+         display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin: 14px 0; }
+  label { display: flex; flex-direction: column; font-size: 13px; color: #334e68; gap: 4px; }
+  input { padding: 6px 8px; border: 1px solid #bcccdc; border-radius: 6px; width: 110px; font-size: 14px; }
+  button { padding: 7px 16px; border: none; border-radius: 6px; background: #2680c2; color: #fff;
+           font-size: 14px; cursor: pointer; }
+  button:disabled { background: #9fb3c8; cursor: not-allowed; }
+  button.ghost { background: #627d98; }
+  #note { margin: 10px 0; min-height: 20px; font-size: 14px; color: #b91c1c; }
+  #note.ok { color: #15803d; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 14px; }
+  th, td { border: 1px solid #e4e7eb; padding: 8px 10px; text-align: left; vertical-align: middle; }
+  th { background: #f0f4f8; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 13px; color: #fff; white-space: nowrap; }
+  .st-RUNNING { background: #2563eb; } .st-PAUSING { background: #d97706; } .st-PAUSED { background: #7c3aed; }
+  .st-COMPLETED { background: #16a34a; } .st-TIMEOUT { background: #dc2626; } .st-FAILED { background: #6b7280; }
+  .bar { background: #e4e7eb; border-radius: 4px; height: 10px; width: 140px; overflow: hidden; display: inline-block; vertical-align: middle; }
+  .bar > div { background: #2680c2; height: 100%; }
+  .small { font-size: 12px; color: #52606d; }
+</style>
+</head>
+<body>
+<h1>缩略图批作业台</h1>
+<p class="hint">值班流程：先「暂停」停住写盘（全部存活进程停住后才显示「已暂停」并停止计时）→ 核对进度 →「继续」让原进程按剩余时限接着跑。
+运行中或暂停确认中，时限一到即强杀整个进程组并报超时；作业结束后，迟到的暂停/继续不会改动结果。</p>
+
+<form id="create-form">
+  <label>运行时限（秒）<input name="limit" type="number" step="1" min="1" max="3600" value="30"></label>
+  <label>缩略图总数<input name="total" type="number" step="1" min="1" max="500" value="12"></label>
+  <label>工作进程数<input name="workers" type="number" step="1" min="1" max="8" value="3"></label>
+  <label>每张耗时（秒）<input name="delay" type="number" step="0.1" min="0" max="30" value="1.0"></label>
+  <button type="submit">启动转换样例</button>
+</form>
+
+<div id="note"></div>
+
+<table>
+  <thead>
+    <tr><th>作业</th><th>状态</th><th>进度</th><th>剩余时限</th><th>已运行</th><th>组内进程</th><th>消息</th><th>操作</th></tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+<p class="small">每秒自动刷新。缩略图与日志输出在服务器 JOB_OUT_DIR/&lt;作业ID&gt;/ 下。</p>
+
+<script>
+const rowsEl = document.getElementById('rows');
+const noteEl = document.getElementById('note');
+let noteTimer = null;
+
+function showNote(text, ok) {
+  noteEl.textContent = text || '';
+  noteEl.className = ok ? 'ok' : '';
+  clearTimeout(noteTimer);
+  noteTimer = setTimeout(() => { noteEl.textContent = ''; }, 8000);
+}
+
+function fmtRemaining(j) {
+  if (j.state === 'PAUSED') return '已冻结 ' + j.remaining.toFixed(1) + 's';
+  if (j.remaining === null || j.remaining === undefined) return '—';
+  return j.remaining.toFixed(1) + 's';
+}
+
+function render(jobs) {
+  rowsEl.innerHTML = '';
+  for (const j of jobs.slice().reverse()) {
+    const tr = document.createElement('tr');
+    const pct = j.total ? Math.min(100, j.done * 100 / j.total) : 0;
+    const procs = j.processes.map(p => p.pid + '(' + p.state + ')').join(' ');
+    tr.innerHTML =
+      '<td>' + j.id + '</td>' +
+      '<td><span class="badge st-' + j.state + '">' + j.state_label + '</span></td>' +
+      '<td><div class="bar"><div style="width:' + pct + '%"></div></div> ' +
+          '<span class="small">' + j.done + '/' + j.total + '</span></td>' +
+      '<td>' + fmtRemaining(j) + '</td>' +
+      '<td>' + j.elapsed_active.toFixed(1) + 's</td>' +
+      '<td class="small" title="' + procs + '">' + j.processes.length + ' 个</td>' +
+      '<td class="small"></td>' +
+      '<td></td>';
+    tr.children[6].textContent = j.message || '';
+    const ops = tr.children[7];
+    const bp = document.createElement('button');
+    bp.textContent = '暂停';
+    bp.disabled = j.state !== 'RUNNING';
+    bp.onclick = () => act(j.id, 'pause');
+    const br = document.createElement('button');
+    br.textContent = '继续';
+    br.className = 'ghost';
+    br.disabled = j.state !== 'PAUSED';
+    br.onclick = () => act(j.id, 'resume');
+    ops.append(bp, ' ', br);
+    rowsEl.appendChild(tr);
+  }
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/jobs');
+    render(await r.json());
+  } catch (e) { /* 忽略瞬时网络错误 */ }
+}
+
+async function act(id, op) {
+  const r = await fetch('/api/jobs/' + id + '/' + op, { method: 'POST' });
+  const body = await r.json().catch(() => ({}));
+  showNote(body.note || (r.ok ? '已受理' : '操作被拒绝'), r.ok);
+  refresh();
+}
+
+document.getElementById('create-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const payload = {
+    limit: Number(fd.get('limit')),
+    total: Number(fd.get('total')),
+    workers: Number(fd.get('workers')),
+    delay: Number(fd.get('delay')),
+  };
+  const r = await fetch('/api/jobs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const body = await r.json().catch(() => ({}));
+  showNote(r.ok ? ('作业 ' + body.id + ' 已启动') : (body.error || '启动失败'), r.ok);
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
